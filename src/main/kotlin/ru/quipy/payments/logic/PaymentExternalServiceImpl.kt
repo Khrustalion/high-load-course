@@ -6,11 +6,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -34,28 +36,45 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rateLimitPerSec.toLong(),
+        Duration.ofSeconds(1)
+    )
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        var submissionLogged = false
+        var interrupted = false
 
         try {
+            val waitMs = deadline - now() - requestAverageProcessingTime.toMillis()
+            if (waitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(waitMs))) {
+                throw SocketTimeoutException("Payment deadline exceeded while waiting for rate limit")
+            }
+
+            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+            submissionLogged = true
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            val remainingMs = deadline - now()
+            if (remainingMs <= 0) {
+                throw SocketTimeoutException("Payment deadline exceeded")
+            }
+            val call = client.newCall(request)
+            call.timeout().timeout(remainingMs, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
@@ -72,6 +91,12 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: Exception) {
+            interrupted = e is InterruptedException
+            if (!submissionLogged) {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+            }
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -88,6 +113,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
         }
     }
 
