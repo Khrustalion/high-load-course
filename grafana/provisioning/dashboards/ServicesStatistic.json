@@ -95,7 +95,8 @@
                     "value": 80
                   }
                 ]
-              }
+              },
+              "unit": "reqps"
             },
             "overrides": []
           },
@@ -126,7 +127,7 @@
                 "uid": "PBFA97CFB590B2093"
               },
               "editorMode": "code",
-              "expr": "sum(rate(payment_finished_total{service=~\"$service\"}[30s])) by (service, outcome, failReason)",
+              "expr": "sum by (service, outcome, failReason) (rate(payment_finished_total{service=~\"$service\", job=\"bombardier-docker-network-job\"}[$__rate_interval]))",
               "hide": false,
               "instant": false,
               "legendFormat": "{{outcome}} - {{failReason}}",
@@ -134,7 +135,7 @@
               "refId": "B"
             }
           ],
-          "title": "Payments outcome rate per second",
+          "title": "Completed requests per second",
           "type": "timeseries"
         },
         {
@@ -1442,7 +1443,7 @@
                   }
                 ]
               },
-              "unit": "short"
+              "unit": "reqps"
             },
             "overrides": [
               {
@@ -1507,15 +1508,15 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "sum(rate(http_external_duration_count{service=~\"$service\"}[30s])) by (method)",
+              "expr": "sum by (service, method, result) (rate(http_external_duration_count{service=~\"$service\", job=\"bombardier-docker-network-job\"}[$__rate_interval]))",
               "hide": false,
               "interval": "",
-              "legendFormat": "{{method}}",
+              "legendFormat": "{{method}} - {{result}}",
               "range": true,
               "refId": "C"
             }
           ],
-          "title": "(Clients -> Online shop) http requests processed rate (rps)",
+          "title": "Incoming requests per second",
           "type": "timeseries"
         },
         {
@@ -1716,7 +1717,7 @@
                   }
                 ]
               },
-              "unit": "none"
+              "unit": "reqps"
             },
             "overrides": [
               {
@@ -1783,7 +1784,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "rate(external_sys_duration_count{service=~\"$service\"}[30s])",
+              "expr": "sum by (service, accountName, outcome) (rate(external_sys_duration_count{service=~\"$service\", job=\"bombardier-docker-network-job\"}[$__rate_interval]))",
               "hide": false,
               "interval": "",
               "legendFormat": "{{accountName}} - {{outcome}}",
@@ -1791,7 +1792,7 @@
               "refId": "C"
             }
           ],
-          "title": "(Online shop -> Payment system)  http requests processed rate (rps)",
+          "title": "Outgoing requests per second",
           "type": "timeseries"
         },
         {

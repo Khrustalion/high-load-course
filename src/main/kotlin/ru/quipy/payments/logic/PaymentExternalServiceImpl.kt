@@ -130,6 +130,10 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun price() = properties.price
 
+    override fun throughputPerSec() = rateLimitPerSec.toLong()
+
+    override fun averageProcessingTime() = requestAverageProcessingTime
+
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
