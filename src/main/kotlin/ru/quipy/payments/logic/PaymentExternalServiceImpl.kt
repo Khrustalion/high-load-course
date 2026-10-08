@@ -12,6 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 
@@ -40,6 +41,7 @@ class PaymentExternalSystemAdapterImpl(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1)
     )
+    private val inFlightRequests = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -48,10 +50,17 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         var submissionLogged = false
         var interrupted = false
+        var slotAcquired = false
 
         try {
-            val waitMs = deadline - now() - requestAverageProcessingTime.toMillis()
-            if (waitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(waitMs))) {
+            val windowWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
+            if (windowWaitMs <= 0 || !inFlightRequests.tryAcquire(windowWaitMs, TimeUnit.MILLISECONDS)) {
+                throw SocketTimeoutException("Payment deadline exceeded while waiting for account window")
+            }
+            slotAcquired = true
+
+            val rateWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
+            if (rateWaitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(rateWaitMs))) {
                 throw SocketTimeoutException("Payment deadline exceeded while waiting for rate limit")
             }
 
@@ -114,6 +123,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
+            if (slotAcquired) inFlightRequests.release()
             if (interrupted) Thread.currentThread().interrupt()
         }
     }
