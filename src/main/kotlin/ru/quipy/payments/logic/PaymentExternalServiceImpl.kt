@@ -53,16 +53,16 @@ class PaymentExternalSystemAdapterImpl(
         var slotAcquired = false
 
         try {
-            val rateWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
-            if (rateWaitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(rateWaitMs))) {
-                throw SocketTimeoutException("Payment deadline exceeded while waiting for rate limit")
-            }
-
             val windowWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
             if (windowWaitMs <= 0 || !inFlightRequests.tryAcquire(windowWaitMs, TimeUnit.MILLISECONDS)) {
                 throw SocketTimeoutException("Payment deadline exceeded while waiting for account window")
             }
             slotAcquired = true
+
+            val rateWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
+            if (rateWaitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(rateWaitMs))) {
+                throw SocketTimeoutException("Payment deadline exceeded while waiting for rate limit")
+            }
 
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
             // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
