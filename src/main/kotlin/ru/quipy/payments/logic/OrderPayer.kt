@@ -14,6 +14,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
 
 @Service
 class OrderPayer {
@@ -39,8 +40,15 @@ class OrderPayer {
     }
 
     private val paymentExecutor by lazy {
-        val workersAmount = paymentAccounts.minOf { it.parallelRequests() }
-        val queueCapacity = paymentAccounts.minOf { it.throughputPerSec() }.toInt()
+        val accountThroughput = paymentAccounts.minOf { it.throughputPerSec() }.toDouble()
+        val parallelRequests = paymentAccounts.minOf { it.parallelRequests() }
+        val workersAmount = minOf(
+            parallelRequests,
+            ceil(accountThroughput * processingTimeMs / 1_000).toInt()
+        ).coerceAtLeast(1)
+        val executorThroughput = workersAmount * 1_000.0 / processingTimeMs
+        val effectiveThroughput = minOf(accountThroughput, executorThroughput)
+        val queueCapacity = ceil(effectiveThroughput * processingTimeMs / 1_000).toInt().coerceAtLeast(1)
 
         ThreadPoolExecutor(
             workersAmount,
