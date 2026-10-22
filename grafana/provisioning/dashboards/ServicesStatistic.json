@@ -2196,14 +2196,27 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "max by (name) (executor_queued_tasks{service=~\"$service\"})",
+              "expr": "max by (job, name) (executor_queued_tasks{name=\"payment-submission-executor\"})",
               "interval": "",
-              "legendFormat": "{{name}}",
+              "legendFormat": "{{job}} queued",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "max by (job, name) (executor_queued_tasks{name=\"payment-submission-executor\"} + executor_queue_remaining_tasks{name=\"payment-submission-executor\"})",
+              "interval": "",
+              "legendFormat": "{{job}} capacity",
+              "range": true,
+              "refId": "B"
             }
           ],
-          "title": "Executors queue size",
+          "title": "Payment queue size / capacity",
           "type": "timeseries"
         },
         {

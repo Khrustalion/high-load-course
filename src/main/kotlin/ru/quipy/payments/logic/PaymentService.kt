@@ -21,6 +21,8 @@ interface PaymentExternalSystemAdapter {
 
     fun throughputPerSec(): Long
 
+    fun parallelRequests(): Int
+
     fun averageProcessingTime(): Duration
 
     fun name(): String

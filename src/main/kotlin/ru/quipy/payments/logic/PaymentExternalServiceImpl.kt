@@ -132,6 +132,8 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun throughputPerSec() = rateLimitPerSec.toLong()
 
+    override fun parallelRequests() = parallelRequests
+
     override fun averageProcessingTime() = requestAverageProcessingTime
 
     override fun isEnabled() = properties.enabled
