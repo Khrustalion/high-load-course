@@ -1,5 +1,7 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -18,7 +20,6 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        const val PAYMENT_WORKERS = 16
     }
 
     @Autowired
@@ -30,25 +31,34 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
+    @Autowired
+    private lateinit var meterRegistry: MeterRegistry
+
     private val processingTimeMs by lazy {
         paymentAccounts.sumOf { it.averageProcessingTime().toMillis() }.coerceAtLeast(1)
     }
 
     private val paymentExecutor by lazy {
         val accountThroughput = paymentAccounts.minOf { it.throughputPerSec() }
-        val executorThroughput = (PAYMENT_WORKERS * 1_000L / processingTimeMs).coerceAtLeast(1)
-        val effectiveThroughput = minOf(accountThroughput, executorThroughput)
+        val workersAmount = minOf(
+            paymentAccounts.minOf { it.parallelRequests() },
+            ((accountThroughput * processingTimeMs + 999) / 1_000).toInt()
+        ).coerceAtLeast(1)
+        val executorThroughput = workersAmount * 1_000.0 / processingTimeMs
+        val effectiveThroughput = minOf(accountThroughput.toDouble(), executorThroughput)
         val queueCapacity = ((effectiveThroughput * processingTimeMs + 999) / 1_000).toInt().coerceAtLeast(1)
 
         ThreadPoolExecutor(
-            PAYMENT_WORKERS,
-            PAYMENT_WORKERS,
+            workersAmount,
+            workersAmount,
             0L,
             TimeUnit.MILLISECONDS,
             ArrayBlockingQueue(queueCapacity),
             NamedThreadFactory("payment-submission-executor"),
             ThreadPoolExecutor.AbortPolicy()
-        )
+        ).also { executor ->
+            ExecutorServiceMetrics.monitor(meterRegistry, executor, "payment-submission-executor")
+        }
     }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
