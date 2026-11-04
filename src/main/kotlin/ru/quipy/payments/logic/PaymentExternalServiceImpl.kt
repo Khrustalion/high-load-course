@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -22,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -41,6 +43,7 @@ class PaymentExternalSystemAdapterImpl(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1)
     )
+    private val rateLimitWait = meterRegistry.timer("payment.rate.limit.wait", "account", accountName)
     private val inFlightRequests = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
 
@@ -60,7 +63,10 @@ class PaymentExternalSystemAdapterImpl(
             slotAcquired = true
 
             val rateWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
-            if (rateWaitMs <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(rateWaitMs))) {
+            val permitAcquired = rateLimitWait.recordCallable {
+                rateWaitMs > 0 && rateLimiter.tickBlocking(Duration.ofMillis(rateWaitMs))
+            }
+            if (permitAcquired != true) {
                 throw SocketTimeoutException("Payment deadline exceeded while waiting for rate limit")
             }
 
@@ -131,6 +137,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun price() = properties.price
 
     override fun throughputPerSec() = rateLimitPerSec.toLong()
+
+    override fun parallelRequests() = parallelRequests
 
     override fun averageProcessingTime() = requestAverageProcessingTime
 
