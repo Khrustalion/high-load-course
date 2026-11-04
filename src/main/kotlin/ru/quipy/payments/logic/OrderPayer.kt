@@ -5,11 +5,13 @@ import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
+import kotlin.math.ceil
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
@@ -34,21 +36,27 @@ class OrderPayer {
     @Autowired
     private lateinit var meterRegistry: MeterRegistry
 
+    @Value("\${payment.executor.capacity-factor:1.25}")
+    private var capacityFactor: Double = 1.25
+
     private val processingTimeMs by lazy {
         paymentAccounts.sumOf { it.averageProcessingTime().toMillis() }.coerceAtLeast(1)
     }
 
     private val paymentExecutor by lazy {
-        val accountThroughput = paymentAccounts.minOf { it.throughputPerSec() }
-        val workersAmount = minOf(
-            paymentAccounts.minOf { it.parallelRequests() },
-            ((accountThroughput * processingTimeMs + 999) / 1_000).toInt()
-        ).coerceAtLeast(1)
-        val executorThroughput = workersAmount * 1_000.0 / processingTimeMs
-        val effectiveThroughput = minOf(accountThroughput.toDouble(), executorThroughput)
-        val queueCapacity = ((effectiveThroughput * processingTimeMs + 999) / 1_000).toInt().coerceAtLeast(1)
+        require(capacityFactor.isFinite() && capacityFactor >= 1.0)
+        val accountThroughput = paymentAccounts.minOf { account ->
+            minOf(
+                account.throughputPerSec().toDouble(),
+                account.parallelRequests() * 1_000.0 /
+                    account.averageProcessingTime().toMillis().coerceAtLeast(1)
+            )
+        }
+        val workersAmount = ceil(accountThroughput * processingTimeMs / 1_000 * capacityFactor)
+            .toInt().coerceAtLeast(1)
+        val queueCapacity = ceil(accountThroughput).toInt().coerceAtLeast(1)
 
-        ThreadPoolExecutor(
+        val executor = ThreadPoolExecutor(
             workersAmount,
             workersAmount,
             0L,
@@ -56,9 +64,8 @@ class OrderPayer {
             ArrayBlockingQueue(queueCapacity),
             NamedThreadFactory("payment-submission-executor"),
             ThreadPoolExecutor.AbortPolicy()
-        ).also { executor ->
-            ExecutorServiceMetrics.monitor(meterRegistry, executor, "payment-submission-executor")
-        }
+        )
+        ExecutorServiceMetrics.monitor(meterRegistry, executor, "payment-submission-executor")
     }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
