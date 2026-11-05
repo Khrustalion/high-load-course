@@ -731,7 +731,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "sum(increase(test_duration_count{service=~\"$service\"}[$__range])) by (service, testOutcome)",
+              "expr": "sum(increase(test_duration_count{service=~\"$service\", job=\"bombardier-docker-network-job\"}[$__range])) by (service, testOutcome)",
               "interval": "",
               "legendFormat": "{{service}} - {{testOutcome}}",
               "range": true,
@@ -975,6 +975,51 @@
           ],
           "title": "Average test duration by service",
           "type": "timeseries"
+        },
+        {
+          "id": 102,
+          "title": "Test duration (activity estimate)",
+          "description": "Estimated span from the first to the last detected completion activity in the selected time range. Select one complete run. Includes sampling and 30-second detection-window error. Multiple runs include gaps between them. This is not the generator-measured run duration.",
+          "type": "stat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 226
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "clocks",
+              "decimals": 0,
+              "noValue": "No activity in range"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max_over_time((timestamp(sum by(service) (test_duration_count{service=~\"$service\",job=\"bombardier-docker-network-job\"})) and on(service) (sum by(service) (changes(test_duration_count{service=~\"$service\",job=\"bombardier-docker-network-job\"}[30s])) > 0))[$__range:10s]) - min_over_time((timestamp(sum by(service) (test_duration_count{service=~\"$service\",job=\"bombardier-docker-network-job\"})) and on(service) (sum by(service) (changes(test_duration_count{service=~\"$service\",job=\"bombardier-docker-network-job\"}[30s])) > 0))[$__range:10s])",
+              "instant": true,
+              "range": false,
+              "legendFormat": "{{service}}"
+            }
+          ]
         }
       ],
       "title": "Tests info",
@@ -1784,7 +1829,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "sum by (service, accountName, outcome) (rate(external_sys_duration_count{service=~\"$service\", job=\"bombardier-docker-network-job\"}[$__rate_interval]))",
+              "expr": "sum by (service, accountName, outcome) (rate(external_sys_duration_count{service=~\"$service\", job=\"bombardier-docker-network-job\"}[30s]))",
               "hide": false,
               "interval": "",
               "legendFormat": "{{accountName}} - {{outcome}}",
@@ -1792,7 +1837,7 @@
               "refId": "C"
             }
           ],
-          "title": "Outgoing requests per second",
+          "title": "Outgoing requests per second (30s window)",
           "type": "timeseries"
         },
         {

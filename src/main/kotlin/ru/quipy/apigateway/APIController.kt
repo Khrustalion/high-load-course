@@ -1,24 +1,34 @@
 package ru.quipy.apigateway
 
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
+import jakarta.annotation.PreDestroy
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.PacedRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import java.time.Duration
+import java.util.concurrent.CompletableFuture
 
 @RestController
-class APIController {
+class APIController(
+    private val orderRepository: OrderRepository,
+    private val orderPayer: OrderPayer,
+    private val meterRegistry: MeterRegistry,
+) {
+    private val admissionWaitTimer = meterRegistry.timer("payment.admission.wait")
+    private val paymentAdmission = PacedRateLimiter(
+        interval = Duration.ofMillis(91),
+        maxWaitingRequests = 288,
+        saturatedIntervalTimer = meterRegistry.timer("payment.admission.saturated.interval"),
+    )
 
-    val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
-
-    @Autowired
-    private lateinit var orderRepository: OrderRepository
-
-    @Autowired
-    private lateinit var orderPayer: OrderPayer
+    @PreDestroy
+    fun closeAdmission() {
+        paymentAdmission.close()
+    }
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -56,18 +66,41 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long,
+    ): CompletableFuture<ResponseEntity<PaymentSubmissionDto>> {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)
             ?: throw IllegalArgumentException("No such order $orderId")
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            ?: return ResponseEntity.status(429)
-                .header("Retry-After", (System.currentTimeMillis() + 1_000).toString())
-                .build()
+        val admissionWaitMs = (deadline - System.currentTimeMillis() - 1_500)
+            .coerceIn(0, 24_000)
+        val waitSample = Timer.start(meterRegistry)
+        return paymentAdmission.acquire(Duration.ofMillis(admissionWaitMs)).thenApplyAsync { admitted ->
+            waitSample.stop(admissionWaitTimer)
+            if (admitted != PacedRateLimiter.AdmissionResult.ADMITTED) {
+                meterRegistry.counter(
+                    "payment.admission.rejected",
+                    "reason",
+                    admitted.name.lowercase(Locale.ROOT),
+                ).increment()
+                return@thenApplyAsync retryPayment("admission")
+            }
 
-        orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+                ?: return@thenApplyAsync retryPayment("order_payer")
+
+            orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+            ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        }
+    }
+
+    private fun retryPayment(reason: String): ResponseEntity<PaymentSubmissionDto> {
+        meterRegistry.counter("payment.submission.rejected", "reason", reason).increment()
+        return ResponseEntity.status(429)
+            .header("Retry-After", (System.currentTimeMillis() + 100).toString())
+            .build()
     }
 
     class PaymentSubmissionDto(
