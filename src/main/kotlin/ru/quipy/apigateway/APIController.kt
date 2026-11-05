@@ -1,13 +1,12 @@
 package ru.quipy.apigateway
 
-import io.micrometer.core.instrument.MeterRegistry
-import io.micrometer.core.instrument.Timer
 import jakarta.annotation.PreDestroy
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.common.utils.PacedRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.PaymentExternalSystemAdapter
 import java.util.*
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
@@ -16,13 +15,14 @@ import java.util.concurrent.CompletableFuture
 class APIController(
     private val orderRepository: OrderRepository,
     private val orderPayer: OrderPayer,
-    private val meterRegistry: MeterRegistry,
+    paymentAccounts: List<PaymentExternalSystemAdapter>,
 ) {
-    private val admissionWaitTimer = meterRegistry.timer("payment.admission.wait")
+    private val accountAverageProcessingTimeMs = paymentAccounts
+        .sumOf { it.averageProcessingTime().toMillis() }
+        .coerceAtLeast(1)
     private val paymentAdmission = PacedRateLimiter(
         interval = Duration.ofMillis(91),
         maxWaitingRequests = 288,
-        saturatedIntervalTimer = meterRegistry.timer("payment.admission.saturated.interval"),
     )
 
     @PreDestroy
@@ -74,30 +74,24 @@ class APIController(
         val order = orderRepository.findById(orderId)
             ?: throw IllegalArgumentException("No such order $orderId")
 
-        val admissionWaitMs = (deadline - System.currentTimeMillis() - 1_500)
+        val remainingTimeMs = (deadline - System.currentTimeMillis()).coerceAtLeast(0)
+        val averageProcessingTimeMs = (remainingTimeMs - accountAverageProcessingTimeMs).coerceAtLeast(0)
+        val admissionWaitMs = (remainingTimeMs - averageProcessingTimeMs)
             .coerceIn(0, 24_000)
-        val waitSample = Timer.start(meterRegistry)
         return paymentAdmission.acquire(Duration.ofMillis(admissionWaitMs)).thenApplyAsync { admitted ->
-            waitSample.stop(admissionWaitTimer)
             if (admitted != PacedRateLimiter.AdmissionResult.ADMITTED) {
-                meterRegistry.counter(
-                    "payment.admission.rejected",
-                    "reason",
-                    admitted.name.lowercase(Locale.ROOT),
-                ).increment()
-                return@thenApplyAsync retryPayment("admission")
+                return@thenApplyAsync retryPayment()
             }
 
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-                ?: return@thenApplyAsync retryPayment("order_payer")
+                ?: return@thenApplyAsync retryPayment()
 
             orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
         }
     }
 
-    private fun retryPayment(reason: String): ResponseEntity<PaymentSubmissionDto> {
-        meterRegistry.counter("payment.submission.rejected", "reason", reason).increment()
+    private fun retryPayment(): ResponseEntity<PaymentSubmissionDto> {
         return ResponseEntity.status(429)
             .header("Retry-After", (System.currentTimeMillis() + 100).toString())
             .build()
