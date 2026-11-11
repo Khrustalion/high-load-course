@@ -27,6 +27,9 @@ class PaymentExternalSystemAdapterImpl(
 ) : PaymentExternalSystemAdapter {
 
     companion object {
+        private const val MAX_PAYMENT_ATTEMPTS = 3
+        private const val TEMPORARY_ERROR_MESSAGE = "Temporary error"
+
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -45,9 +48,17 @@ class PaymentExternalSystemAdapterImpl(
     )
     private val rateLimitWait = meterRegistry.timer("payment.rate.limit.wait", "account", accountName)
     private val inFlightRequests = Semaphore(parallelRequests, true)
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder().retryOnConnectionFailure(false).build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        repeat(MAX_PAYMENT_ATTEMPTS) {
+            val response = performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline) ?: return
+            if (response.result || response.message != TEMPORARY_ERROR_MESSAGE) return
+            if (deadline - now() <= requestAverageProcessingTime.toMillis()) return
+        }
+    }
+
+    private fun performPaymentAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): ExternalSysResponse? {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -78,15 +89,15 @@ class PaymentExternalSystemAdapterImpl(
             submissionLogged = true
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
             val remainingMs = deadline - now()
             if (remainingMs <= 0) {
                 throw SocketTimeoutException("Payment deadline exceeded")
             }
+            val request = Request.Builder().run {
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(remainingMs)}")
+                post(emptyBody)
+            }.build()
+
             val call = client.newCall(request)
             call.timeout().timeout(remainingMs, TimeUnit.MILLISECONDS)
             call.execute().use { response ->
@@ -104,6 +115,7 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+                return if (response.isSuccessful) body else null
             }
         } catch (e: Exception) {
             interrupted = e is InterruptedException
@@ -132,6 +144,7 @@ class PaymentExternalSystemAdapterImpl(
             if (slotAcquired) inFlightRequests.release()
             if (interrupted) Thread.currentThread().interrupt()
         }
+        return null
     }
 
     override fun price() = properties.price
