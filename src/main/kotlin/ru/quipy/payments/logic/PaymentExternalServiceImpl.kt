@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -29,6 +30,7 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         private const val MAX_PAYMENT_ATTEMPTS = 3
+        private const val PAYMENT_ATTEMPT_TIMEOUT_MS = 1500L
         private const val TEMPORARY_ERROR_MESSAGE = "Temporary error"
 
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -58,19 +60,20 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         repeat(MAX_PAYMENT_ATTEMPTS) { attempt ->
-            val response = performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, isRetry = attempt > 0) ?: return
-            if (response.result || response.message != TEMPORARY_ERROR_MESSAGE) return
+            val shouldRetry = performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, isRetry = attempt > 0)
+            if (!shouldRetry) return
             if (deadline - now() <= requestAverageProcessingTime.toMillis()) return
         }
     }
 
-    private fun performPaymentAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, isRetry: Boolean): ExternalSysResponse? {
+    private fun performPaymentAttempt(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, isRetry: Boolean): Boolean {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         var submissionLogged = false
         var interrupted = false
         var slotAcquired = false
+        var httpInProgress = false
 
         try {
             val windowWaitMs = deadline - now() - requestAverageProcessingTime.toMillis()
@@ -99,25 +102,33 @@ class PaymentExternalSystemAdapterImpl(
             if (remainingMs <= 0) {
                 throw SocketTimeoutException("Payment deadline exceeded")
             }
+            val attemptTimeoutMs = minOf(PAYMENT_ATTEMPT_TIMEOUT_MS, remainingMs)
             val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(remainingMs)}")
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(attemptTimeoutMs)}")
                 post(emptyBody)
             }.build()
 
             val call = client.newCall(request)
-            call.timeout().timeout(remainingMs, TimeUnit.MILLISECONDS)
+            call.timeout().timeout(attemptTimeoutMs, TimeUnit.MILLISECONDS)
             if (isRetry) httpRetries.increment()
+            httpInProgress = true
             val (successful, body) = httpDuration.recordCallable {
                 call.execute().use { response ->
+                    if (response.code == 408) {
+                        throw SocketTimeoutException("Payment provider returned HTTP 408")
+                    }
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: InterruptedIOException) {
+                        throw e
                     } catch (e: Exception) {
                         logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                     }
                     response.isSuccessful to body
                 }
-            } ?: return null
+            } ?: return false
+            httpInProgress = false
 
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
@@ -126,16 +137,16 @@ class PaymentExternalSystemAdapterImpl(
             paymentESService.update(paymentId) {
                 it.logProcessing(body.result, now(), transactionId, reason = body.message)
             }
-            return if (successful) body else null
+            return successful && !body.result && body.message == TEMPORARY_ERROR_MESSAGE
         } catch (e: Exception) {
-            interrupted = e is InterruptedException
+            interrupted = e is InterruptedException || Thread.currentThread().isInterrupted
             if (!submissionLogged) {
                 paymentESService.update(paymentId) {
                     it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
             }
             when (e) {
-                is SocketTimeoutException -> {
+                is InterruptedIOException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
@@ -150,11 +161,11 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+            return httpInProgress && e is InterruptedIOException && !interrupted
         } finally {
             if (slotAcquired) inFlightRequests.release()
             if (interrupted) Thread.currentThread().interrupt()
         }
-        return null
     }
 
     override fun price() = properties.price
